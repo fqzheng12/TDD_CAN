@@ -39,17 +39,45 @@
 
 typedef enum{
 	PROT_IDLE = 0,
-	PROT_RECEIVING,
-	PROT_RESPONSE,
+	PROT_IN_RECEIVING,
+	PROT_IN_SENDING,
+	PORT_OUT_SENDING,
+	PROT_OUT_RECEIVING,
 } PROT_STATE;
+
+typedef struct{
+	uint8_t  message_type;
+	uint8_t  command;
+	uint8_t  command_type;
+	uint16_t data_length;
+	uint16_t data_cnt;
+	uint8_t  data[512];
+} can_message_t;
+
+typedef struct{
+	uint8_t  message_type;
+	uint8_t  command;
+	uint8_t  command_type;
+} message_info_t;
+
+#ifdef _CPPUTEST_
+#include "CAN_helper.h"
+#endif
 
 void CAN_protocol_init(void);
 PROT_STATE CAN_protocol_get_state(void);
-uint16_t CAN_protocol_get_data_length(void);
-uint16_t CAN_protocol_get_message_id(void);
-int8_t CAN_protocol_import_data(uint8_t*, uint8_t);
-void CAN_protocol_get_data(uint8_t*, uint8_t, uint8_t);
 
-uint8_t  CAN_protocol_check_rcv_message(uint8_t*);
+uint16_t CAN_protocol_get_data_in_length(void);
+uint16_t CAN_protocol_get_in_message_id(void);
+
+int8_t CAN_protocol_in_receiving_data(uint8_t*, uint8_t);
+void CAN_protocol_get_data_received(uint8_t*, uint8_t, uint8_t);
+void CAN_protocol_get_message_in_info(message_info_t*);
+uint8_t CAN_protocol_check_in_received_message(uint8_t*);
+
+void CAN_protocol_set_message_out_info(message_info_t*);
+void CAN_protocol_set_data_out_length(uint16_t);
+void CAN_protocol_set_data_sending(uint8_t*, uint8_t, uint8_t);
+int8_t CAN_protocol_in_sending_data(uint8_t*);
 
 #endif  /* D_CANProtocol_H */

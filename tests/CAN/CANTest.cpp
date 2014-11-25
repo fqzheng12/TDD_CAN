@@ -24,11 +24,14 @@ extern "C"
 
 #include "CppUTest/TestHarness.h"
 
+message_info_t message_info;
+
 TEST_GROUP(CANProtocolDriver)
 {
     void setup()
     {
 		memset(RxMessageData, 0, 8);
+		memset(TxMessageData, 0, 8);
 		RxMessageData[3] = 0x23;
 		RxMessageData[4] = 0x01;
 		RxMessageData[5] = 0x00;
@@ -56,89 +59,163 @@ IGNORE_TEST(CANProtocolDriver, testMessageID)
 	LONGS_EQUAL(0xBBAA, id);
 }
 
-IGNORE_TEST(CANProtocolDriver, checkMessageID)
-{
-	uint8_t check;
-	uint16_t id;
-
-	check = CAN_protocol_check_rcv_message(RxMessageData);
-	id = CAN_protocol_get_message_id();
-	
-	BYTES_EQUAL(1, check);
-	BYTES_EQUAL(0, id);
-}
-
-IGNORE_TEST(CANProtocolDriver, importData)
+TEST(CANProtocolDriver, testInit)
 {
 	PROT_STATE state;
-	uint8_t check;
-	uint16_t length;
-	uint8_t data;
+	uint16_t in_id;
 
 	state = CAN_protocol_get_state();
-	CAN_protocol_get_data(&data, 0, 1);
-	BYTES_EQUAL(0, data);
+	in_id = CAN_protocol_get_in_message_id();
 	BYTES_EQUAL(PROT_IDLE, state);
-	
-	check = CAN_protocol_check_rcv_message(RxMessageData);
-	BYTES_EQUAL(1, check);
-	BYTES_EQUAL(PROT_RECEIVING, state);	
-	
-	length = CAN_protocol_get_data_length();	
-	LONGS_EQUAL(0x123, length);
-
-	check = CAN_protocol_import_data(RxMessageData, 8);
-
-	CAN_protocol_get_data(&data, 0, 1);
-	BYTES_EQUAL(0x45, data);
+	LONGS_EQUAL(0, in_id);
 }
 
-TEST(CANProtocolDriver, importData)
+TEST(CANProtocolDriver, rcvMessageChkID)
 {
-	PROT_STATE state;
 	uint8_t check;
-	uint16_t length;
-	uint8_t data;
-
-	state = CAN_protocol_get_state();
-	CAN_protocol_get_data(&data, 0, 1);
-	BYTES_EQUAL(0, data);
-	BYTES_EQUAL(PROT_IDLE, state);
+	uint16_t in_id, length;
 
 	RxMessageData[3] = 0x0A;
 	RxMessageData[4] = 0x00;
-	check = CAN_protocol_check_rcv_message(RxMessageData);
+	RxMessageData[5] = 0x00;
+	RxMessageData[6] = 0x00;
+	
+	check = CAN_protocol_check_in_received_message(RxMessageData);
+	in_id = CAN_protocol_get_in_message_id();
+	length = CAN_protocol_get_data_in_length();
 	BYTES_EQUAL(1, check);
-	state = CAN_protocol_get_state();
-	BYTES_EQUAL(PROT_RECEIVING, state);		
-	length = CAN_protocol_get_data_length();	
-	LONGS_EQUAL(0x000A, length);
+	LONGS_EQUAL(0, in_id);	
+	LONGS_EQUAL(10, length);
+}
 
-	check = CAN_protocol_import_data(RxMessageData, 8);
+TEST(CANProtocolDriver, getInMessageData)
+{
+	uint8_t data;
+	int8_t check;
+	uint16_t state;
+
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);
+	BYTES_EQUAL(-1, check);
+
+	data = 0;
+	RxMessageData[3] = 0x0A;
+	RxMessageData[4] = 0x00;
+	RxMessageData[5] = 0x00;
+	RxMessageData[6] = 0x00;
+	RxMessageData[7] = 0x45;
+	
+	check = CAN_protocol_check_in_received_message(RxMessageData);
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);
 	BYTES_EQUAL(0, check);
-	CAN_protocol_get_data(&data, 0, 1);
+	state = CAN_protocol_get_state();
+	BYTES_EQUAL(PROT_IN_RECEIVING, state);	
+
+	RxMessageData[0] = 0x01;
+	RxMessageData[1] = 0x02;
+	RxMessageData[2] = 0x03;	
+	RxMessageData[3] = 0x04;
+	RxMessageData[4] = 0x05;
+	RxMessageData[5] = 0x06;
+	RxMessageData[6] = 0x07;
+	RxMessageData[7] = 0x08;
+	
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);
+	BYTES_EQUAL(0, check);	
+
+	RxMessageData[0] = 0x09;
+	RxMessageData[1] = 0x0A;
+	RxMessageData[2] = 0x0B;	
+	RxMessageData[3] = 0x0C;
+	RxMessageData[4] = 0x0D;
+	RxMessageData[5] = 0x0E;
+	RxMessageData[6] = 0x0F;
+	RxMessageData[7] = 0x10;
+	
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);	
+	BYTES_EQUAL(1, check);
+	CAN_protocol_get_data_received(&data, 0, 1);
 	BYTES_EQUAL(0x45, data);
-	
-	RxMessageData[0] = 0x00;
-	RxMessageData[1] = 0x01;
-	RxMessageData[2] = 0x02;
-	RxMessageData[3] = 0x03;
-	RxMessageData[4] = 0x04;
-	RxMessageData[5] = 0x05;
-	RxMessageData[6] = 0x06;
-	RxMessageData[7] = 0x07;	
-	check = CAN_protocol_import_data(RxMessageData, 8);
-	BYTES_EQUAL(0, check);
-	CAN_protocol_get_data(&data, 7, 1);
-	BYTES_EQUAL(0x06, data);
-
-	RxMessageData[0] = 0x08;
-	RxMessageData[1] = 0x09;	
-	check = CAN_protocol_import_data(RxMessageData, 8);	
-	BYTES_EQUAL(1, check);
-	CAN_protocol_get_data(&data, 1, 1);
-	BYTES_EQUAL(0x00, data);
+	CAN_protocol_get_data_received(&data, 9, 1);
+	BYTES_EQUAL(9, data);
+	CAN_protocol_get_data_received(&data, 10, 1);
+	BYTES_EQUAL(0x0, data);
 	state = CAN_protocol_get_state();
-	BYTES_EQUAL(PROT_RESPONSE, state);		
+	BYTES_EQUAL(PROT_IN_SENDING, state);
+}
+
+TEST(CANProtocolDriver, replyInSendingData)
+{
+	uint8_t data[10];
+	int8_t check;
+	uint16_t state;
+
+//	data = 0;
+	RxMessageData[0] = 0x03;
+	RxMessageData[1] = 0x01;
+	RxMessageData[2] = 0x00;
+	RxMessageData[3] = 0x0A;
+	RxMessageData[4] = 0x00;
+	RxMessageData[5] = 0x00;
+	RxMessageData[6] = 0x00;
+	RxMessageData[7] = 0x45;
 	
+	check = CAN_protocol_check_in_received_message(RxMessageData);
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);
+
+	RxMessageData[0] = 0x01;
+	RxMessageData[1] = 0x02;
+	RxMessageData[2] = 0x03;	
+	RxMessageData[3] = 0x04;
+	RxMessageData[4] = 0x05;
+	RxMessageData[5] = 0x06;
+	RxMessageData[6] = 0x07;
+	RxMessageData[7] = 0x08;
+	
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);
+
+	RxMessageData[0] = 0x09;
+	RxMessageData[1] = 0x0A;
+	RxMessageData[2] = 0x0B;	
+	RxMessageData[3] = 0x0C;
+	RxMessageData[4] = 0x0D;
+	RxMessageData[5] = 0x0E;
+	RxMessageData[6] = 0x0F;
+	RxMessageData[7] = 0x10;
+	
+	check = CAN_protocol_in_receiving_data(RxMessageData, 8);	
+	BYTES_EQUAL(1, check);
+	state = CAN_protocol_get_state();
+	BYTES_EQUAL(PROT_IN_SENDING, state);
+	CAN_protocol_get_message_in_info(&message_info);
+	BYTES_EQUAL(0x03, message_info.message_type);
+	BYTES_EQUAL(0x01, message_info.command);
+	BYTES_EQUAL(0x00, message_info.command_type);
+	
+	data[0] = 0x45;
+	data[1] = 0x08;
+	data[2] = 0x07;
+	data[3] = 0x06;
+	data[4] = 0x05;
+	data[5] = 0x04;
+	data[6] = 0x03;
+	data[7] = 0x02;
+	data[8] = 0x01;	
+	data[9] = 0x0A;	
+	
+	CAN_protocol_set_message_out_info(&message_info);
+	CAN_protocol_set_data_out_length(480);
+	CAN_protocol_set_data_sending(data, 0, 10);
+	check = CAN_protocol_in_sending_data(TxMessageData);
+	BYTES_EQUAL(0xE0, TxMessageData[3]);
+	BYTES_EQUAL(0x01, TxMessageData[4]);
+	BYTES_EQUAL(0x45, TxMessageData[7]);
+	BYTES_EQUAL(0, check);
+	check = CAN_protocol_in_sending_data(TxMessageData);
+	BYTES_EQUAL(0x08, TxMessageData[0]);
+	BYTES_EQUAL(0, check);	
+	check = CAN_protocol_in_sending_data(TxMessageData);
+	BYTES_EQUAL(0x0A, TxMessageData[0]);	
+	BYTES_EQUAL(0, check);	
+	state= CAN_protocol_get_state();
+	BYTES_EQUAL(PROT_IN_SENDING, state);
 }
