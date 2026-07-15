@@ -4,15 +4,16 @@
 用法:
   python3 scripts/export_sector_fundflow.py
   python3 scripts/export_sector_fundflow.py --out data/fundflow
-  python3 scripts/export_sector_fundflow.py --top 30 --leaders 3
+  python3 scripts/export_sector_fundflow.py --top 30 --leaders 3 --gainers 5
 
 说明:
   - f62 为主力净流入（元），属行情商估算，非交易所官方持仓。
   - 默认优先 push2 实时接口，失败则回退 push2delay。
-  - 每个行业导出：成交额(f6)最大 N 只 + 涨幅榜 N 只（默认各 3）。
+  - 每个行业导出：成交额最大 N 只（默认 3）+ 涨幅榜 M 只（默认 5）。
   - 涨幅榜优先选约 10% 涨停股，不以涨跌幅数值大小为主排序。
   - 终端/TXT 使用中文显示宽度对齐；CSV 供 Excel。
 """
+
 
 
 from __future__ import annotations
@@ -244,7 +245,9 @@ def fill_leader_cols(row: dict, prefix: str, leaders: list[dict], n: int) -> Non
         row[f"_{prefix}第{j}_成交额_raw"] = s["amount_yi"] if s else None
 
 
-def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict], list[dict]]:
+def enrich_boards(
+    rows: list[dict], side: str, leaders: int, gainers: int
+) -> tuple[list[dict], list[dict]]:
     """返回 (板块行, 成分股明细行)。"""
     board_out: list[dict] = []
     stock_out: list[dict] = []
@@ -259,12 +262,14 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
 
         amount_tops: list[dict] = []
         pct_tops: list[dict] = []
-        if board_code and leaders > 0:
+        if board_code and (leaders > 0 or gainers > 0):
             try:
-                amount_tops = fetch_board_top_by_amount(board_code, leaders)
-                time.sleep(0.05)
-                pct_tops = fetch_board_top_by_gain(board_code, leaders)
-                time.sleep(0.05)
+                if leaders > 0:
+                    amount_tops = fetch_board_top_by_amount(board_code, leaders)
+                    time.sleep(0.05)
+                if gainers > 0:
+                    pct_tops = fetch_board_top_by_gain(board_code, gainers)
+                    time.sleep(0.05)
             except RuntimeError:
                 amount_tops, pct_tops = [], []
 
@@ -282,7 +287,7 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
             "_主力净流入_亿_raw": net_yi,
         }
         fill_leader_cols(row, "成交额", amount_tops, leaders)
-        fill_leader_cols(row, "涨幅", pct_tops, leaders)
+        fill_leader_cols(row, "涨幅", pct_tops, gainers)
         board_out.append(row)
 
         for s in amount_tops:
@@ -354,7 +359,9 @@ def _fmt_leader_cell(row: dict, prefix: str, j: int) -> str:
     return f"{name}({code}) {price_s} {fmt_pct(pct, signed=True)}"
 
 
-def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str]:
+def format_aligned_lines(
+    title: str, rows: list[dict], leaders: int, gainers: int
+) -> list[str]:
     cols = [
         ("排名", 4, "right"),
         ("代码", 8, "left"),
@@ -365,7 +372,7 @@ def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str
     # Dynamic leader columns: name/code + price(元) + metric.
     for j in range(1, leaders + 1):
         cols.append((f"成交额#{j}", 38, "left"))
-    for j in range(1, leaders + 1):
+    for j in range(1, gainers + 1):
         cols.append((f"涨幅#{j}", 36, "left"))
 
     lines = [title, ""]
@@ -385,7 +392,7 @@ def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str
         ]
         for j in range(1, leaders + 1):
             values.append(_fmt_leader_cell(r, "成交额", j))
-        for j in range(1, leaders + 1):
+        for j in range(1, gainers + 1):
             values.append(_fmt_leader_cell(r, "涨幅", j))
 
         line_cells = []
@@ -395,28 +402,36 @@ def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str
     return lines
 
 
-def print_table(title: str, rows: list[dict], leaders: int) -> None:
-    for line in format_aligned_lines(f"=== {title} ===", rows, leaders):
+def print_table(title: str, rows: list[dict], leaders: int, gainers: int) -> None:
+    for line in format_aligned_lines(f"=== {title} ===", rows, leaders, gainers):
         print(line)
     print()
 
 
-def write_aligned_txt(path: Path, title: str, rows: list[dict], leaders: int) -> None:
+def write_aligned_txt(
+    path: Path, title: str, rows: list[dict], leaders: int, gainers: int
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = format_aligned_lines(title, rows, leaders)
+    lines = format_aligned_lines(title, rows, leaders, gainers)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="导出行业主力资金净流入/流出 TOP N，并附成交额/涨幅最大股票"
+        description="导出行业主力资金净流入/流出 TOP N，并附成交额/涨幅股票"
     )
     parser.add_argument("--top", type=int, default=30, help="各榜行业条数，默认 30")
     parser.add_argument(
         "--leaders",
         type=int,
         default=3,
-        help="每个行业取成交额最大 / 涨幅最大的股票数，默认 3",
+        help="每个行业成交额最大股票数，默认 3",
+    )
+    parser.add_argument(
+        "--gainers",
+        type=int,
+        default=5,
+        help="每个行业涨幅榜股票数（优先10%%涨停），默认 5",
     )
     parser.add_argument(
         "--out",
@@ -427,8 +442,8 @@ def main() -> int:
     parser.add_argument("--no-print", action="store_true", help="不打印表格，只写文件")
     args = parser.parse_args()
 
-    if args.top <= 0 or args.leaders < 0:
-        print("--top 必须 > 0，--leaders 必须 >= 0", file=sys.stderr)
+    if args.top <= 0 or args.leaders < 0 or args.gainers < 0:
+        print("--top 必须 > 0，--leaders/--gainers 必须 >= 0", file=sys.stderr)
         return 2
 
     now = bj_now()
@@ -442,9 +457,16 @@ def main() -> int:
         print(e, file=sys.stderr)
         return 1
 
-    print("正在补充各行业成交额TOP / 涨幅TOP股票...", file=sys.stderr)
-    inflow, inflow_stocks = enrich_boards(inflow_raw, "净流入", args.leaders)
-    outflow, outflow_stocks = enrich_boards(outflow_raw, "净流出", args.leaders)
+    print(
+        f"正在补充各行业成交额TOP{args.leaders} / 涨幅TOP{args.gainers}股票...",
+        file=sys.stderr,
+    )
+    inflow, inflow_stocks = enrich_boards(
+        inflow_raw, "净流入", args.leaders, args.gainers
+    )
+    outflow, outflow_stocks = enrich_boards(
+        outflow_raw, "净流出", args.leaders, args.gainers
+    )
 
     out_dir = args.out
     inflow_path = out_dir / f"industry_inflow_top{args.top}_{stamp}.csv"
@@ -467,15 +489,15 @@ def main() -> int:
     write_csv(latest_stocks, inflow_stocks + outflow_stocks)
 
     title_in = (
-        f"行业主力净流入 TOP{args.top} | 成交额TOP{args.leaders} + 涨幅TOP{args.leaders} | {stamp}"
+        f"行业主力净流入 TOP{args.top} | 成交额TOP{args.leaders} + 涨幅TOP{args.gainers} | {stamp}"
     )
     title_out = (
-        f"行业主力净流出 TOP{args.top} | 成交额TOP{args.leaders} + 涨幅TOP{args.leaders} | {stamp}"
+        f"行业主力净流出 TOP{args.top} | 成交额TOP{args.leaders} + 涨幅TOP{args.gainers} | {stamp}"
     )
-    write_aligned_txt(inflow_txt, title_in, inflow, args.leaders)
-    write_aligned_txt(outflow_txt, title_out, outflow, args.leaders)
-    write_aligned_txt(latest_in_txt, title_in, inflow, args.leaders)
-    write_aligned_txt(latest_out_txt, title_out, outflow, args.leaders)
+    write_aligned_txt(inflow_txt, title_in, inflow, args.leaders, args.gainers)
+    write_aligned_txt(outflow_txt, title_out, outflow, args.leaders, args.gainers)
+    write_aligned_txt(latest_in_txt, title_in, inflow, args.leaders, args.gainers)
+    write_aligned_txt(latest_out_txt, title_out, outflow, args.leaders, args.gainers)
 
     meta = {
         "as_of": now.isoformat(),
@@ -484,6 +506,7 @@ def main() -> int:
         "note": "主力净流入为估算字段；成交额按 f6；涨幅榜优先 10%涨停，不以涨跌幅数值为主；TXT 为中文对齐文本",
         "top": args.top,
         "leaders": args.leaders,
+        "gainers": args.gainers,
         "files": {
             "inflow": str(inflow_path),
             "outflow": str(outflow_path),
@@ -503,10 +526,10 @@ def main() -> int:
     if not args.no_print:
         print(
             f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"行业资金流 TOP{args.top} + 成交额TOP{args.leaders} + 涨幅TOP{args.leaders}"
+            f"行业资金流 TOP{args.top} + 成交额TOP{args.leaders} + 涨幅TOP{args.gainers}"
         )
-        print_table(f"净流入 TOP{args.top}", inflow, args.leaders)
-        print_table(f"净流出 TOP{args.top}", outflow, args.leaders)
+        print_table(f"净流入 TOP{args.top}", inflow, args.leaders, args.gainers)
+        print_table(f"净流出 TOP{args.top}", outflow, args.leaders, args.gainers)
         print("\n已写出:")
         print(f"  {inflow_path}")
         print(f"  {outflow_path}")
