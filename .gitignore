@@ -42,5 +42,9 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
-# Generated market data exports
-data/fundflow/
+# Generated market data exports (keep *_latest.* for repo preview)
+data/fundflow/*
+!data/fundflow/*_latest.csv
+!data/fundflow/*_latest.txt
+scripts/__pycache__/
+*.pyc
