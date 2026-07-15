@@ -9,9 +9,11 @@
 说明:
   - f62 为主力净流入（元），属行情商估算，非交易所官方持仓。
   - 默认优先 push2 实时接口，失败则回退 push2delay。
-  - 每个行业导出：成交额(f6)最大 N 只 + 涨幅(f3)最大 N 只（默认各 3）。
+  - 每个行业导出：成交额(f6)最大 N 只 + 涨幅榜 N 只（默认各 3）。
+  - 涨幅榜优先选约 10% 涨停股，不以涨跌幅数值大小为主排序。
   - 终端/TXT 使用中文显示宽度对齐；CSV 供 Excel。
 """
+
 
 from __future__ import annotations
 
@@ -173,12 +175,18 @@ def normalize_stock(x: dict) -> dict:
     }
 
 
-def fetch_board_top_stocks(board_code: str, n: int, fid: str) -> list[dict]:
-    """按指定字段取板块前 N（fid=f6 成交额，fid=f3 涨幅）。"""
+def is_10pct_limit_up(change_pct: float | None) -> bool:
+    """主板常见 10% 涨停（约 +9.80%~+10.20%），不含 20%/30% 板。"""
+    if change_pct is None:
+        return False
+    return 9.80 <= change_pct <= 10.20
+
+
+def fetch_board_stocks(board_code: str, fid: str, pool: int) -> list[dict]:
     rows = clist_get(
         {
             "pn": "1",
-            "pz": str(max(n, 1)),
+            "pz": str(max(pool, 1)),
             "po": "1",
             "np": "1",
             "fltt": "2",
@@ -188,9 +196,35 @@ def fetch_board_top_stocks(board_code: str, n: int, fid: str) -> list[dict]:
             "fields": STOCK_FIELDS,
         }
     )
+    return [normalize_stock(x) for x in rows]
+
+
+def fetch_board_top_by_amount(board_code: str, n: int) -> list[dict]:
+    stocks = fetch_board_stocks(board_code, "f6", n)
     out = []
-    for i, x in enumerate(rows[:n], 1):
-        item = normalize_stock(x)
+    for i, s in enumerate(stocks[:n], 1):
+        item = dict(s)
+        item["rank"] = i
+        out.append(item)
+    return out
+
+
+def fetch_board_top_by_gain(board_code: str, n: int, pool: int = 100) -> list[dict]:
+    """涨幅榜：有 10% 涨停则优先入选；同为 10% 涨停时按成交额，其余再按涨幅。"""
+    stocks = fetch_board_stocks(board_code, "f3", max(pool, n))
+
+    def sort_key(s: dict) -> tuple:
+        pct = s.get("change_pct")
+        amt = s.get("amount_yi") or 0.0
+        if is_10pct_limit_up(pct):
+            # 优先档；同档不比涨跌幅大小，比成交额
+            return (1, amt, 0.0)
+        return (0, pct if pct is not None else float("-inf"), amt)
+
+    ranked = sorted(stocks, key=sort_key, reverse=True)
+    out = []
+    for i, s in enumerate(ranked[:n], 1):
+        item = dict(s)
         item["rank"] = i
         out.append(item)
     return out
@@ -227,9 +261,9 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
         pct_tops: list[dict] = []
         if board_code and leaders > 0:
             try:
-                amount_tops = fetch_board_top_stocks(board_code, leaders, "f6")
+                amount_tops = fetch_board_top_by_amount(board_code, leaders)
                 time.sleep(0.05)
-                pct_tops = fetch_board_top_stocks(board_code, leaders, "f3")
+                pct_tops = fetch_board_top_by_gain(board_code, leaders)
                 time.sleep(0.05)
             except RuntimeError:
                 amount_tops, pct_tops = [], []
@@ -447,7 +481,7 @@ def main() -> int:
         "as_of": now.isoformat(),
         "trade_date_guess": day,
         "source": "eastmoney clist f62 + board constituents by f6/f3",
-        "note": "主力净流入为估算字段；成交额龙头按 f6，涨幅龙头按 f3；TXT 为中文对齐文本",
+        "note": "主力净流入为估算字段；成交额按 f6；涨幅榜优先 10%涨停，不以涨跌幅数值为主；TXT 为中文对齐文本",
         "top": args.top,
         "leaders": args.leaders,
         "files": {
