@@ -140,6 +140,28 @@ def _num(value: object) -> float | None:
         return None
 
 
+def fmt_yi_from_yi(value: object, signed: bool = False, digits: int = 2) -> str:
+    """Format a value already in 亿, e.g. 99.81亿 / +99.81亿."""
+    num = _num(value)
+    if num is None:
+        return "-"
+    return (f"{num:+.{digits}f}亿" if signed else f"{num:.{digits}f}亿")
+
+
+def fmt_yuan(value: object, digits: int = 2) -> str:
+    num = _num(value)
+    if num is None:
+        return "-"
+    return f"{num:.{digits}f}元"
+
+
+def fmt_pct(value: object, signed: bool = False, digits: int = 2) -> str:
+    num = _num(value)
+    if num is None:
+        return "-"
+    return (f"{num:+.{digits}f}%" if signed else f"{num:.{digits}f}%")
+
+
 def normalize_stock(x: dict) -> dict:
     amt = _num(x.get("f6")) or 0.0
     return {
@@ -147,7 +169,7 @@ def normalize_stock(x: dict) -> dict:
         "name": str(x.get("f14") or ""),
         "price": _num(x.get("f2")),
         "change_pct": _num(x.get("f3")),
-        "amount_yi": round(amt / 1e8, 4),
+        "amount_yi": round(amt / 1e8, 2),
     }
 
 
@@ -179,9 +201,13 @@ def fill_leader_cols(row: dict, prefix: str, leaders: list[dict], n: int) -> Non
         s = leaders[j - 1] if j <= len(leaders) else None
         row[f"{prefix}第{j}_代码"] = s["code"] if s else ""
         row[f"{prefix}第{j}_名称"] = s["name"] if s else ""
-        row[f"{prefix}第{j}_现价"] = s["price"] if s else ""
-        row[f"{prefix}第{j}_涨跌%"] = s["change_pct"] if s else ""
-        row[f"{prefix}第{j}_成交额_亿"] = s["amount_yi"] if s else ""
+        row[f"{prefix}第{j}_现价"] = fmt_yuan(s["price"]) if s else ""
+        row[f"{prefix}第{j}_涨跌幅"] = fmt_pct(s["change_pct"], signed=True) if s else ""
+        row[f"{prefix}第{j}_成交额"] = fmt_yi_from_yi(s["amount_yi"]) if s else ""
+        # keep raw for TXT formatting helpers
+        row[f"_{prefix}第{j}_现价_raw"] = s["price"] if s else None
+        row[f"_{prefix}第{j}_涨跌_raw"] = s["change_pct"] if s else None
+        row[f"_{prefix}第{j}_成交额_raw"] = s["amount_yi"] if s else None
 
 
 def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict], list[dict]]:
@@ -192,9 +218,10 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
     for i, x in enumerate(rows, 1):
         board_code = str(x.get("f12") or "")
         board_name = str(x.get("f14") or "")
-        net = float(x.get("f62") or 0)
-        huge = float(x.get("f66") or 0)
+        net = _num(x.get("f62")) or 0.0
+        huge = _num(x.get("f66")) or 0.0
         chg_f = _num(x.get("f3"))
+        ratio = _num(x.get("f184"))
 
         amount_tops: list[dict] = []
         pct_tops: list[dict] = []
@@ -207,16 +234,18 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
             except RuntimeError:
                 amount_tops, pct_tops = [], []
 
+        net_yi = round(net / 1e8, 2)
         row = {
             "排名": i,
             "方向": side,
             "板块代码": board_code,
             "板块名称": board_name,
-            "涨跌幅%": chg_f,
-            "主力净流入_元": net,
-            "主力净流入_亿": round(net / 1e8, 4),
-            "超大单净额_亿": round(huge / 1e8, 4),
-            "主力净流入占比%": x.get("f184"),
+            "涨跌幅": fmt_pct(chg_f),
+            "主力净流入": fmt_yi_from_yi(net_yi, signed=True),
+            "超大单净额": fmt_yi_from_yi(round(huge / 1e8, 2), signed=True),
+            "主力净流入占比": fmt_pct(ratio),
+            "_涨跌幅_raw": chg_f,
+            "_主力净流入_亿_raw": net_yi,
         }
         fill_leader_cols(row, "成交额", amount_tops, leaders)
         fill_leader_cols(row, "涨幅", pct_tops, leaders)
@@ -229,15 +258,15 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
                     "板块排名": i,
                     "板块代码": board_code,
                     "板块名称": board_name,
-                    "板块涨跌幅%": chg_f,
-                    "板块主力净流入_亿": round(net / 1e8, 4),
+                    "板块涨跌幅": fmt_pct(chg_f),
+                    "板块主力净流入": fmt_yi_from_yi(net_yi, signed=True),
                     "排序口径": "成交额",
                     "股票排名": s["rank"],
                     "股票代码": s["code"],
                     "股票名称": s["name"],
-                    "现价": s["price"],
-                    "涨跌幅%": s["change_pct"],
-                    "成交额_亿": s["amount_yi"],
+                    "现价": fmt_yuan(s["price"]),
+                    "涨跌幅": fmt_pct(s["change_pct"], signed=True),
+                    "成交额": fmt_yi_from_yi(s["amount_yi"]),
                 }
             )
         for s in pct_tops:
@@ -247,15 +276,15 @@ def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict]
                     "板块排名": i,
                     "板块代码": board_code,
                     "板块名称": board_name,
-                    "板块涨跌幅%": chg_f,
-                    "板块主力净流入_亿": round(net / 1e8, 4),
+                    "板块涨跌幅": fmt_pct(chg_f),
+                    "板块主力净流入": fmt_yi_from_yi(net_yi, signed=True),
                     "排序口径": "涨幅",
                     "股票排名": s["rank"],
                     "股票代码": s["code"],
                     "股票名称": s["name"],
-                    "现价": s["price"],
-                    "涨跌幅%": s["change_pct"],
-                    "成交额_亿": s["amount_yi"],
+                    "现价": fmt_yuan(s["price"]),
+                    "涨跌幅": fmt_pct(s["change_pct"], signed=True),
+                    "成交额": fmt_yi_from_yi(s["amount_yi"]),
                 }
             )
 
@@ -267,9 +296,10 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fieldnames = list(rows[0].keys())
+    # Drop internal raw helper fields from CSV.
+    fieldnames = [k for k in rows[0].keys() if not k.startswith("_")]
     with path.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
@@ -277,15 +307,17 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 def _fmt_leader_cell(row: dict, prefix: str, j: int) -> str:
     name = row.get(f"{prefix}第{j}_名称") or "-"
     code = row.get(f"{prefix}第{j}_代码") or ""
+    price = row.get(f"_{prefix}第{j}_现价_raw")
+    price_s = fmt_yuan(price)
     if prefix == "成交额":
-        amt = row.get(f"{prefix}第{j}_成交额_亿")
+        amt = row.get(f"_{prefix}第{j}_成交额_raw")
         if amt in ("", None):
             return "-"
-        return f"{name}({code}) {float(amt):.1f}亿"
-    pct = row.get(f"{prefix}第{j}_涨跌%")
+        return f"{name}({code}) {price_s} {fmt_yi_from_yi(amt)}"
+    pct = row.get(f"_{prefix}第{j}_涨跌_raw")
     if pct in ("", None):
         return "-"
-    return f"{name}({code}) {float(pct):+.2f}%"
+    return f"{name}({code}) {price_s} {fmt_pct(pct, signed=True)}"
 
 
 def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str]:
@@ -293,14 +325,14 @@ def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str
         ("排名", 4, "right"),
         ("代码", 8, "left"),
         ("名称", 20, "left"),
-        ("涨跌%", 7, "right"),
-        ("净流入(亿)", 10, "right"),
+        ("涨跌幅", 8, "right"),
+        ("净流入", 10, "right"),
     ]
-    # Dynamic leader columns: keep readable width.
+    # Dynamic leader columns: name/code + price(元) + metric.
     for j in range(1, leaders + 1):
-        cols.append((f"成交额#{j}", 30, "left"))
+        cols.append((f"成交额#{j}", 38, "left"))
     for j in range(1, leaders + 1):
-        cols.append((f"涨幅#{j}", 28, "left"))
+        cols.append((f"涨幅#{j}", 36, "left"))
 
     lines = [title, ""]
     header_cells = []
@@ -310,15 +342,12 @@ def format_aligned_lines(title: str, rows: list[dict], leaders: int) -> list[str
     lines.append("  ".join("-" * w for _, w, _ in cols))
 
     for r in rows:
-        chg = r["涨跌幅%"]
-        chg_s = f"{chg:.2f}" if chg is not None else "-"
-        net_s = f"{r['主力净流入_亿']:+.2f}"
         values = [
             str(r["排名"]),
             r["板块代码"],
             r["板块名称"],
-            chg_s,
-            net_s,
+            r.get("涨跌幅") or "-",
+            r.get("主力净流入") or "-",
         ]
         for j in range(1, leaders + 1):
             values.append(_fmt_leader_cell(r, "成交额", j))
