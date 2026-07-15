@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""导出东财行业板块主力资金净流入/净流出 TOP20。
+"""导出东财行业板块主力资金净流入/净流出 TOP20，并附带各行业成交额最大的股票。
 
 用法:
   python3 scripts/export_sector_fundflow.py
   python3 scripts/export_sector_fundflow.py --out data/fundflow
-  python3 scripts/export_sector_fundflow.py --top 20 --no-print
+  python3 scripts/export_sector_fundflow.py --top 20 --leaders 2
 
 说明:
   - f62 为主力净流入（元），属行情商估算，非交易所官方持仓。
   - 默认优先 push2 实时接口，失败则回退 push2delay。
+  - 每个行业额外导出成交额(f6)最大的 N 只股票（默认 2）。
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ HOSTS = (
 )
 
 INDUSTRY_FS = "m:90+t:2+f:!50"
-FIELDS = "f12,f14,f2,f3,f62,f66,f69,f72,f184,f20"
+BOARD_FIELDS = "f12,f14,f2,f3,f62,f66,f69,f72,f184,f20"
+STOCK_FIELDS = "f12,f14,f2,f3,f6,f20"
 
 
 def bj_now() -> datetime:
@@ -54,22 +56,9 @@ def http_get_json(url: str, timeout: float = 15.0) -> dict:
     return json.loads(raw)
 
 
-def fetch_board_flow(top: int, inflow: bool, retries: int = 4) -> list[dict]:
-    """拉取行业板块资金流列表。inflow=True 净流入降序，False 净流出（升序）。"""
-    params = {
-        "pn": "1",
-        "pz": str(top),
-        "po": "1" if inflow else "0",
-        "np": "1",
-        "fltt": "2",
-        "invt": "2",
-        "fid": "f62",
-        "fs": INDUSTRY_FS,
-        "fields": FIELDS,
-    }
+def clist_get(params: dict, retries: int = 4) -> list[dict]:
     query = urllib.parse.urlencode(params)
     last_err: Exception | None = None
-
     for host in HOSTS:
         url = f"{host}/api/qt/clist/get?{query}"
         for attempt in range(retries):
@@ -81,34 +70,130 @@ def fetch_board_flow(top: int, inflow: bool, retries: int = 4) -> list[dict]:
                 return rows
             except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as e:
                 last_err = e
-                time.sleep(0.4 * (attempt + 1))
-    raise RuntimeError(f"拉取板块资金流失败: {last_err}")
+                time.sleep(0.35 * (attempt + 1))
+    raise RuntimeError(f"clist 请求失败: {last_err}")
 
 
-def normalize_rows(rows: list[dict], side: str) -> list[dict]:
+def fetch_board_flow(top: int, inflow: bool) -> list[dict]:
+    """拉取行业板块资金流列表。inflow=True 净流入降序，False 净流出（升序）。"""
+    return clist_get(
+        {
+            "pn": "1",
+            "pz": str(top),
+            "po": "1" if inflow else "0",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f62",
+            "fs": INDUSTRY_FS,
+            "fields": BOARD_FIELDS,
+        }
+    )
+
+
+def fetch_board_top_stocks(board_code: str, leaders: int) -> list[dict]:
+    """按成交额 f6 取板块内前 N 只股票。"""
+    rows = clist_get(
+        {
+            "pn": "1",
+            "pz": str(max(leaders, 1)),
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f6",
+            "fs": f"b:{board_code}+f:!50",
+            "fields": STOCK_FIELDS,
+        }
+    )
     out = []
-    for i, x in enumerate(rows, 1):
-        net = float(x.get("f62") or 0)
-        huge = float(x.get("f66") or 0)
+    for i, x in enumerate(rows[:leaders], 1):
+        px = x.get("f2")
         chg = x.get("f3")
+        amt = float(x.get("f6") or 0)
         try:
-            chg_f = float(chg)
+            px_f = float(px) if px not in (None, "-") else None
+        except (TypeError, ValueError):
+            px_f = None
+        try:
+            chg_f = float(chg) if chg not in (None, "-") else None
         except (TypeError, ValueError):
             chg_f = None
         out.append(
             {
-                "排名": i,
-                "方向": side,
-                "板块代码": x.get("f12") or "",
-                "板块名称": x.get("f14") or "",
-                "涨跌幅%": chg_f,
-                "主力净流入_元": net,
-                "主力净流入_亿": round(net / 1e8, 4),
-                "超大单净额_亿": round(huge / 1e8, 4),
-                "主力净流入占比%": x.get("f184"),
+                "rank": i,
+                "code": str(x.get("f12") or ""),
+                "name": str(x.get("f14") or ""),
+                "price": px_f,
+                "change_pct": chg_f,
+                "amount_yi": round(amt / 1e8, 4),
             }
         )
     return out
+
+
+def enrich_boards(rows: list[dict], side: str, leaders: int) -> tuple[list[dict], list[dict]]:
+    """返回 (板块行, 成分股明细行)。"""
+    board_out: list[dict] = []
+    stock_out: list[dict] = []
+
+    for i, x in enumerate(rows, 1):
+        board_code = str(x.get("f12") or "")
+        board_name = str(x.get("f14") or "")
+        net = float(x.get("f62") or 0)
+        huge = float(x.get("f66") or 0)
+        try:
+            chg_f = float(x.get("f3"))
+        except (TypeError, ValueError):
+            chg_f = None
+
+        tops: list[dict] = []
+        if board_code and leaders > 0:
+            try:
+                tops = fetch_board_top_stocks(board_code, leaders)
+                time.sleep(0.08)
+            except RuntimeError:
+                tops = []
+
+        row = {
+            "排名": i,
+            "方向": side,
+            "板块代码": board_code,
+            "板块名称": board_name,
+            "涨跌幅%": chg_f,
+            "主力净流入_元": net,
+            "主力净流入_亿": round(net / 1e8, 4),
+            "超大单净额_亿": round(huge / 1e8, 4),
+            "主力净流入占比%": x.get("f184"),
+        }
+        for j in range(1, leaders + 1):
+            s = tops[j - 1] if j <= len(tops) else None
+            row[f"成交额第{j}_代码"] = s["code"] if s else ""
+            row[f"成交额第{j}_名称"] = s["name"] if s else ""
+            row[f"成交额第{j}_现价"] = s["price"] if s else ""
+            row[f"成交额第{j}_涨跌%"] = s["change_pct"] if s else ""
+            row[f"成交额第{j}_成交额_亿"] = s["amount_yi"] if s else ""
+        board_out.append(row)
+
+        for s in tops:
+            stock_out.append(
+                {
+                    "方向": side,
+                    "板块排名": i,
+                    "板块代码": board_code,
+                    "板块名称": board_name,
+                    "板块涨跌幅%": chg_f,
+                    "板块主力净流入_亿": round(net / 1e8, 4),
+                    "股票成交额排名": s["rank"],
+                    "股票代码": s["code"],
+                    "股票名称": s["name"],
+                    "现价": s["price"],
+                    "涨跌幅%": s["change_pct"],
+                    "成交额_亿": s["amount_yi"],
+                }
+            )
+
+    return board_out, stock_out
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -123,21 +208,36 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         w.writerows(rows)
 
 
-def print_table(title: str, rows: list[dict]) -> None:
+def print_table(title: str, rows: list[dict], leaders: int) -> None:
     print(f"\n=== {title} ===")
-    print(f'{"排名":<4} {"代码":<8} {"名称":<12} {"涨跌%":>8} {"净流入(亿)":>12} {"超大单(亿)":>10}')
+    header = f'{"排名":<4} {"代码":<8} {"名称":<12} {"涨跌%":>7} {"净流入(亿)":>10}'
+    for j in range(1, leaders + 1):
+        header += f'  | 成交额#{j}'
+    print(header)
     for r in rows:
         chg = r["涨跌幅%"]
         chg_s = f"{chg:.2f}" if chg is not None else "-"
-        print(
+        line = (
             f'{r["排名"]:<4} {r["板块代码"]:<8} {r["板块名称"]:<12} '
-            f'{chg_s:>8} {r["主力净流入_亿"]:>+12.2f} {r["超大单净额_亿"]:>+10.2f}'
+            f'{chg_s:>7} {r["主力净流入_亿"]:>+10.2f}'
         )
+        for j in range(1, leaders + 1):
+            name = r.get(f"成交额第{j}_名称") or "-"
+            code = r.get(f"成交额第{j}_代码") or ""
+            amt = r.get(f"成交额第{j}_成交额_亿")
+            pct = r.get(f"成交额第{j}_涨跌%")
+            if amt == "" or amt is None:
+                line += "  | -"
+            else:
+                pct_s = f"{float(pct):+.2f}%" if pct not in ("", None) else "-"
+                line += f"  | {name}({code}) {float(amt):.1f}亿 {pct_s}"
+        print(line)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="导出行业主力资金净流入/流出 TOP N")
-    parser.add_argument("--top", type=int, default=20, help="各榜条数，默认 20")
+    parser = argparse.ArgumentParser(description="导出行业主力资金净流入/流出 TOP N，并附成交额最大股票")
+    parser.add_argument("--top", type=int, default=20, help="各榜行业条数，默认 20")
+    parser.add_argument("--leaders", type=int, default=2, help="每个行业取成交额最大的股票数，默认 2")
     parser.add_argument(
         "--out",
         type=Path,
@@ -147,8 +247,8 @@ def main() -> int:
     parser.add_argument("--no-print", action="store_true", help="不打印表格，只写文件")
     args = parser.parse_args()
 
-    if args.top <= 0:
-        print("--top 必须 > 0", file=sys.stderr)
+    if args.top <= 0 or args.leaders < 0:
+        print("--top 必须 > 0，--leaders 必须 >= 0", file=sys.stderr)
         return 2
 
     now = bj_now()
@@ -162,46 +262,56 @@ def main() -> int:
         print(e, file=sys.stderr)
         return 1
 
-    inflow = normalize_rows(inflow_raw, "净流入")
-    outflow = normalize_rows(outflow_raw, "净流出")
+    print("正在补充各行业成交额最大股票...", file=sys.stderr)
+    inflow, inflow_stocks = enrich_boards(inflow_raw, "净流入", args.leaders)
+    outflow, outflow_stocks = enrich_boards(outflow_raw, "净流出", args.leaders)
 
     out_dir = args.out
     inflow_path = out_dir / f"industry_inflow_top{args.top}_{stamp}.csv"
     outflow_path = out_dir / f"industry_outflow_top{args.top}_{stamp}.csv"
+    stocks_path = out_dir / f"industry_top_stocks_{stamp}.csv"
     latest_in = out_dir / f"industry_inflow_top{args.top}_latest.csv"
     latest_out = out_dir / f"industry_outflow_top{args.top}_latest.csv"
+    latest_stocks = out_dir / "industry_top_stocks_latest.csv"
     meta_path = out_dir / f"industry_fundflow_meta_{stamp}.json"
 
     write_csv(inflow_path, inflow)
     write_csv(outflow_path, outflow)
+    write_csv(stocks_path, inflow_stocks + outflow_stocks)
     write_csv(latest_in, inflow)
     write_csv(latest_out, outflow)
+    write_csv(latest_stocks, inflow_stocks + outflow_stocks)
 
     meta = {
         "as_of": now.isoformat(),
         "trade_date_guess": day,
-        "source": "eastmoney clist f62",
-        "note": "主力净流入为估算字段，仅供观察",
+        "source": "eastmoney clist f62 + board constituents by f6",
+        "note": "主力净流入为估算字段；成交额龙头按板块内 f6 排序",
         "top": args.top,
+        "leaders": args.leaders,
         "files": {
             "inflow": str(inflow_path),
             "outflow": str(outflow_path),
+            "top_stocks": str(stocks_path),
             "inflow_latest": str(latest_in),
             "outflow_latest": str(latest_out),
+            "top_stocks_latest": str(latest_stocks),
         },
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if not args.no_print:
-        print(f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} | 行业资金流 TOP{args.top}")
-        print_table(f"净流入 TOP{args.top}", inflow)
-        print_table(f"净流出 TOP{args.top}", outflow)
+        print(f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} | 行业资金流 TOP{args.top} + 成交额TOP{args.leaders}")
+        print_table(f"净流入 TOP{args.top}", inflow, args.leaders)
+        print_table(f"净流出 TOP{args.top}", outflow, args.leaders)
         print("\n已写出:")
         print(f"  {inflow_path}")
         print(f"  {outflow_path}")
+        print(f"  {stocks_path}")
         print(f"  {latest_in}")
         print(f"  {latest_out}")
+        print(f"  {latest_stocks}")
         print(f"  {meta_path}")
 
     return 0
