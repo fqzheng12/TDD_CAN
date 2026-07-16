@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""导出东财行业板块主力资金净流入/净流出 TOP N，并附带龙头股。
+
+用法:
+  python3 scripts/export_sector_fundflow.py
+  python3 scripts/export_sector_fundflow.py --side both --top 30
+  python3 scripts/export_sector_fundflow.py --side inflow --top 20
+  python3 scripts/export_sector_fundflow.py --keyword 白酒
+
+说明:
+  - f62 为主力净流入（元），属行情商估算，非交易所官方持仓。
+  - 默认优先 push2delay，失败再试 push2。
+  - --side 可选 inflow / outflow / both；--top / --in-top / --out-top 控制名次。
+  - --keyword 按名称筛选行业+概念板块（如「白酒」），单独输出主题 TXT。
+  - 每个行业：成交额 TOP（默认 3）+ 涨幅 TOP（默认 5，优先约 10% 涨停）。
+  - 只输出带北京时间戳的 TXT 对齐报告，不写 CSV。
+"""
+
+
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+BJ = timezone(timedelta(hours=8))
+
+HOSTS = (
+    "https://push2delay.eastmoney.com",
+    "https://push2.eastmoney.com",
+)
+
+INDUSTRY_FS = "m:90+t:2+f:!50"
+CONCEPT_FS = "m:90+t:3+f:!50"
+BOARD_FIELDS = "f12,f14,f2,f3,f62,f66,f69,f72,f184,f20"
+STOCK_FIELDS = "f12,f14,f2,f3,f6,f20"
+
+
+def bj_now() -> datetime:
+    return datetime.now(BJ)
+
+
+def display_width(text: str) -> int:
+    """Approximate terminal display width (CJK = 2 columns)."""
+    width = 0
+    for ch in str(text):
+        o = ord(ch)
+        if (
+            0x1100 <= o <= 0x115F
+            or 0x2E80 <= o <= 0x303E
+            or 0x3040 <= o <= 0xA4CF
+            or 0xAC00 <= o <= 0xD7A3
+            or 0xF900 <= o <= 0xFAFF
+            or 0xFE10 <= o <= 0xFE19
+            or 0xFE30 <= o <= 0xFE6F
+            or 0xFF00 <= o <= 0xFF60
+            or 0xFFE0 <= o <= 0xFFE6
+        ):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def pad_display(text: object, width: int, align: str = "left") -> str:
+    s = "" if text is None else str(text)
+    pad = max(0, width - display_width(s))
+    if align == "right":
+        return " " * pad + s
+    if align == "center":
+        left = pad // 2
+        return " " * left + s + " " * (pad - left)
+    return s + " " * pad
+
+
+def http_get_json(url: str, timeout: float = 15.0) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    if not raw or raw.strip()[:1] not in "{[":
+        raise ValueError(f"非 JSON 响应: {raw[:120]!r}")
+    return json.loads(raw)
+
+
+def clist_get(params: dict, retries: int = 2) -> list[dict]:
+    query = urllib.parse.urlencode(params)
+    last_err: Exception | None = None
+    for host in HOSTS:
+        url = f"{host}/api/qt/clist/get?{query}"
+        for attempt in range(retries):
+            try:
+                data = http_get_json(url)
+                rows = ((data.get("data") or {}).get("diff")) or []
+                if not rows:
+                    raise ValueError("返回列表为空")
+                return rows
+            except urllib.error.HTTPError as e:
+                last_err = e
+                # 502/503: switch host immediately
+                if e.code in (502, 503, 504):
+                    break
+                time.sleep(0.35 * (attempt + 1))
+            except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as e:
+                last_err = e
+                time.sleep(0.35 * (attempt + 1))
+    raise RuntimeError(f"clist 请求失败: {last_err}")
+
+
+def fetch_board_flow(top: int, inflow: bool) -> list[dict]:
+    """拉取行业板块资金流列表。inflow=True 净流入降序，False 净流出（升序）。"""
+    return clist_get(
+        {
+            "pn": "1",
+            "pz": str(top),
+            "po": "1" if inflow else "0",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f62",
+            "fs": INDUSTRY_FS,
+            "fields": BOARD_FIELDS,
+        }
+    )
+
+
+def fetch_all_boards(fs: str, pz: int = 200) -> list[dict]:
+    return clist_get(
+        {
+            "pn": "1",
+            "pz": str(pz),
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f62",
+            "fs": fs,
+            "fields": BOARD_FIELDS,
+        }
+    )
+
+
+def fetch_boards_by_keyword(keyword: str) -> list[dict]:
+    """按板块名称关键词筛选行业+概念板块，按主力净流入降序。"""
+    key = keyword.strip()
+    if not key:
+        return []
+    # 白酒主题额外覆盖酿酒概念等常见同义名
+    aliases = {key}
+    if "白酒" in key or key == "酒":
+        aliases.update({"白酒", "酿酒"})
+    matched: dict[str, dict] = {}
+    for fs, kind in ((INDUSTRY_FS, "行业"), (CONCEPT_FS, "概念")):
+        for row in fetch_all_boards(fs):
+            name = str(row.get("f14") or "")
+            code = str(row.get("f12") or "")
+            if not code or not any(a in name for a in aliases):
+                continue
+            item = dict(row)
+            item["_board_kind"] = kind
+            matched[code] = item
+    rows = list(matched.values())
+    rows.sort(key=lambda x: _num(x.get("f62")) or float("-inf"), reverse=True)
+    return rows
+
+
+def safe_filename_part(text: str) -> str:
+    keep = []
+    for ch in text.strip():
+        if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff") or ch in ("-", "_"):
+            keep.append(ch)
+        elif ch.isspace():
+            keep.append("_")
+    return "".join(keep) or "theme"
+
+
+def _num(value: object) -> float | None:
+    if value in (None, "-", ""):
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_yi_from_yi(value: object, signed: bool = False, digits: int = 2) -> str:
+    """Format a value already in 亿, e.g. 99.81亿 / +99.81亿."""
+    num = _num(value)
+    if num is None:
+        return "-"
+    return (f"{num:+.{digits}f}亿" if signed else f"{num:.{digits}f}亿")
+
+
+def fmt_yuan(value: object, digits: int = 2) -> str:
+    num = _num(value)
+    if num is None:
+        return "-"
+    return f"{num:.{digits}f}元"
+
+
+def fmt_pct(value: object, signed: bool = False, digits: int = 2) -> str:
+    num = _num(value)
+    if num is None:
+        return "-"
+    return (f"{num:+.{digits}f}%" if signed else f"{num:.{digits}f}%")
+
+
+def normalize_stock(x: dict) -> dict:
+    amt = _num(x.get("f6")) or 0.0
+    return {
+        "code": str(x.get("f12") or ""),
+        "name": str(x.get("f14") or ""),
+        "price": _num(x.get("f2")),
+        "change_pct": _num(x.get("f3")),
+        "amount_yi": round(amt / 1e8, 2),
+    }
+
+
+def is_10pct_limit_up(change_pct: float | None) -> bool:
+    """主板常见 10% 涨停（约 +9.80%~+10.20%），不含 20%/30% 板。"""
+    if change_pct is None:
+        return False
+    return 9.80 <= change_pct <= 10.20
+
+
+def fetch_board_stocks(board_code: str, fid: str, pool: int) -> list[dict]:
+    rows = clist_get(
+        {
+            "pn": "1",
+            "pz": str(max(pool, 1)),
+            "po": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": fid,
+            "fs": f"b:{board_code}+f:!50",
+            "fields": STOCK_FIELDS,
+        }
+    )
+    return [normalize_stock(x) for x in rows]
+
+
+def fetch_board_top_by_amount(board_code: str, n: int) -> list[dict]:
+    stocks = fetch_board_stocks(board_code, "f6", n)
+    out = []
+    for i, s in enumerate(stocks[:n], 1):
+        item = dict(s)
+        item["rank"] = i
+        out.append(item)
+    return out
+
+
+def fetch_board_top_by_gain(board_code: str, n: int, pool: int = 100) -> list[dict]:
+    """涨幅榜：有 10% 涨停则优先入选；同为 10% 涨停时按成交额，其余再按涨幅。"""
+    stocks = fetch_board_stocks(board_code, "f3", max(pool, n))
+
+    def sort_key(s: dict) -> tuple:
+        pct = s.get("change_pct")
+        amt = s.get("amount_yi") or 0.0
+        if is_10pct_limit_up(pct):
+            # 优先档；同档不比涨跌幅大小，比成交额
+            return (1, amt, 0.0)
+        return (0, pct if pct is not None else float("-inf"), amt)
+
+    ranked = sorted(stocks, key=sort_key, reverse=True)
+    out = []
+    for i, s in enumerate(ranked[:n], 1):
+        item = dict(s)
+        item["rank"] = i
+        out.append(item)
+    return out
+
+
+def fill_leader_cols(row: dict, prefix: str, leaders: list[dict], n: int) -> None:
+    for j in range(1, n + 1):
+        s = leaders[j - 1] if j <= len(leaders) else None
+        row[f"{prefix}第{j}_代码"] = s["code"] if s else ""
+        row[f"{prefix}第{j}_名称"] = s["name"] if s else ""
+        row[f"{prefix}第{j}_现价"] = fmt_yuan(s["price"]) if s else ""
+        row[f"{prefix}第{j}_涨跌幅"] = fmt_pct(s["change_pct"], signed=True) if s else ""
+        row[f"{prefix}第{j}_成交额"] = fmt_yi_from_yi(s["amount_yi"]) if s else ""
+        # keep raw for TXT formatting helpers
+        row[f"_{prefix}第{j}_现价_raw"] = s["price"] if s else None
+        row[f"_{prefix}第{j}_涨跌_raw"] = s["change_pct"] if s else None
+        row[f"_{prefix}第{j}_成交额_raw"] = s["amount_yi"] if s else None
+
+
+def enrich_boards(
+    rows: list[dict], side: str, leaders: int, gainers: int
+) -> tuple[list[dict], list[dict]]:
+    """返回 (板块行, 成分股明细行)。"""
+    board_out: list[dict] = []
+    stock_out: list[dict] = []
+
+    for i, x in enumerate(rows, 1):
+        board_code = str(x.get("f12") or "")
+        board_name = str(x.get("f14") or "")
+        net = _num(x.get("f62")) or 0.0
+        huge = _num(x.get("f66")) or 0.0
+        chg_f = _num(x.get("f3"))
+        ratio = _num(x.get("f184"))
+
+        amount_tops: list[dict] = []
+        pct_tops: list[dict] = []
+        if board_code and (leaders > 0 or gainers > 0):
+            try:
+                if leaders > 0:
+                    amount_tops = fetch_board_top_by_amount(board_code, leaders)
+                    time.sleep(0.05)
+                if gainers > 0:
+                    pct_tops = fetch_board_top_by_gain(board_code, gainers)
+                    time.sleep(0.05)
+            except RuntimeError:
+                amount_tops, pct_tops = [], []
+
+        net_yi = round(net / 1e8, 2)
+        side_label = side
+        if side in ("主题", "筛选"):
+            side_label = "净流入" if net_yi >= 0 else "净流出"
+        row = {
+            "排名": i,
+            "方向": side_label,
+            "板块类型": str(x.get("_board_kind") or "行业"),
+            "板块代码": board_code,
+            "板块名称": board_name,
+            "涨跌幅": fmt_pct(chg_f),
+            "主力净流入": fmt_yi_from_yi(net_yi, signed=True),
+            "超大单净额": fmt_yi_from_yi(round(huge / 1e8, 2), signed=True),
+            "主力净流入占比": fmt_pct(ratio),
+            "_涨跌幅_raw": chg_f,
+            "_主力净流入_亿_raw": net_yi,
+        }
+        fill_leader_cols(row, "成交额", amount_tops, leaders)
+        fill_leader_cols(row, "涨幅", pct_tops, gainers)
+        board_out.append(row)
+
+        for s in amount_tops:
+            stock_out.append(
+                {
+                    "方向": side,
+                    "板块排名": i,
+                    "板块代码": board_code,
+                    "板块名称": board_name,
+                    "板块涨跌幅": fmt_pct(chg_f),
+                    "板块主力净流入": fmt_yi_from_yi(net_yi, signed=True),
+                    "排序口径": "成交额",
+                    "股票排名": s["rank"],
+                    "股票代码": s["code"],
+                    "股票名称": s["name"],
+                    "现价": fmt_yuan(s["price"]),
+                    "涨跌幅": fmt_pct(s["change_pct"], signed=True),
+                    "成交额": fmt_yi_from_yi(s["amount_yi"]),
+                }
+            )
+        for s in pct_tops:
+            stock_out.append(
+                {
+                    "方向": side,
+                    "板块排名": i,
+                    "板块代码": board_code,
+                    "板块名称": board_name,
+                    "板块涨跌幅": fmt_pct(chg_f),
+                    "板块主力净流入": fmt_yi_from_yi(net_yi, signed=True),
+                    "排序口径": "涨幅",
+                    "股票排名": s["rank"],
+                    "股票代码": s["code"],
+                    "股票名称": s["name"],
+                    "现价": fmt_yuan(s["price"]),
+                    "涨跌幅": fmt_pct(s["change_pct"], signed=True),
+                    "成交额": fmt_yi_from_yi(s["amount_yi"]),
+                }
+            )
+
+    return board_out, stock_out
+
+
+def write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    # Drop internal raw helper fields from CSV.
+    fieldnames = [k for k in rows[0].keys() if not k.startswith("_")]
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _fmt_leader_cell(row: dict, prefix: str, j: int) -> str:
+    name = row.get(f"{prefix}第{j}_名称") or "-"
+    code = row.get(f"{prefix}第{j}_代码") or ""
+    price = row.get(f"_{prefix}第{j}_现价_raw")
+    price_s = fmt_yuan(price)
+    if prefix == "成交额":
+        amt = row.get(f"_{prefix}第{j}_成交额_raw")
+        if amt in ("", None):
+            return "-"
+        return f"{name}({code}) {price_s} {fmt_yi_from_yi(amt)}"
+    pct = row.get(f"_{prefix}第{j}_涨跌_raw")
+    if pct in ("", None):
+        return "-"
+    return f"{name}({code}) {price_s} {fmt_pct(pct, signed=True)}"
+
+
+def format_aligned_lines(
+    title: str, rows: list[dict], leaders: int, gainers: int
+) -> list[str]:
+    show_kind = any(r.get("板块类型") for r in rows)
+    cols = [
+        ("排名", 4, "right"),
+    ]
+    if show_kind:
+        cols.append(("类型", 4, "left"))
+    cols.extend(
+        [
+            ("代码", 8, "left"),
+            ("名称", 20, "left"),
+            ("涨跌幅", 8, "right"),
+            ("净流入", 10, "right"),
+        ]
+    )
+    # Dynamic leader columns: name/code + price(元) + metric.
+    for j in range(1, leaders + 1):
+        cols.append((f"成交额#{j}", 38, "left"))
+    for j in range(1, gainers + 1):
+        cols.append((f"涨幅#{j}", 36, "left"))
+
+    lines = [title, ""]
+    header_cells = []
+    for key, width, align in cols:
+        header_cells.append(pad_display(key, width, align))
+    lines.append("  ".join(header_cells))
+    lines.append("  ".join("-" * w for _, w, _ in cols))
+
+    for r in rows:
+        values = [str(r["排名"])]
+        if show_kind:
+            values.append(r.get("板块类型") or "-")
+        values.extend(
+            [
+                r["板块代码"],
+                r["板块名称"],
+                r.get("涨跌幅") or "-",
+                r.get("主力净流入") or "-",
+            ]
+        )
+        for j in range(1, leaders + 1):
+            values.append(_fmt_leader_cell(r, "成交额", j))
+        for j in range(1, gainers + 1):
+            values.append(_fmt_leader_cell(r, "涨幅", j))
+
+        line_cells = []
+        for (key, width, align), val in zip(cols, values):
+            line_cells.append(pad_display(val, width, align))
+        lines.append("  ".join(line_cells))
+    return lines
+
+
+def print_table(title: str, rows: list[dict], leaders: int, gainers: int) -> None:
+    for line in format_aligned_lines(f"=== {title} ===", rows, leaders, gainers):
+        print(line)
+    print()
+
+
+def write_aligned_txt(
+    path: Path, title: str, rows: list[dict], leaders: int, gainers: int
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = format_aligned_lines(title, rows, leaders, gainers)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="导出行业主力资金净流入/流出 TOP N，并附成交额/涨幅股票"
+    )
+    parser.add_argument(
+        "--side",
+        choices=("inflow", "outflow", "both"),
+        default="both",
+        help="只拉流入 / 只拉流出 / 两边都拉，默认 both",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=30,
+        help="所选方向的行业名次数，默认 30；可被 --in-top/--out-top 覆盖",
+    )
+    parser.add_argument(
+        "--in-top",
+        type=int,
+        default=None,
+        help="净流入行业名次数（仅 side=inflow/both 时生效）",
+    )
+    parser.add_argument(
+        "--out-top",
+        type=int,
+        default=None,
+        help="净流出行业名次数（仅 side=outflow/both 时生效）",
+    )
+    parser.add_argument(
+        "--leaders",
+        type=int,
+        default=3,
+        help="每个行业成交额最大股票数，默认 3",
+    )
+    parser.add_argument(
+        "--gainers",
+        type=int,
+        default=5,
+        help="每个行业涨幅榜股票数（优先10%%涨停），默认 5",
+    )
+    parser.add_argument(
+        "--keyword",
+        type=str,
+        default="",
+        help="按板块名关键词筛选行业+概念（如：白酒），单独输出主题报告",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("data/fundflow"),
+        help="输出目录，默认 data/fundflow",
+    )
+    parser.add_argument("--no-print", action="store_true", help="不打印表格，只写文件")
+    args = parser.parse_args()
+
+    if args.leaders < 0 or args.gainers < 0:
+        print("--leaders/--gainers 必须 >= 0", file=sys.stderr)
+        return 2
+
+    now = bj_now()
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    time_label = now.strftime("%Y-%m-%d %H:%M:%S")
+    out_dir = args.out
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+
+    # 主题/关键词模式：只拉匹配板块
+    if args.keyword.strip():
+        keyword = args.keyword.strip()
+        try:
+            print(f"按关键词筛选板块: {keyword} ...", file=sys.stderr)
+            raw = fetch_boards_by_keyword(keyword)
+            if not raw:
+                print(f"未找到名称含「{keyword}」的行业/概念板块", file=sys.stderr)
+                return 1
+            print(
+                f"命中 {len(raw)} 个板块，补充成交额TOP{args.leaders} / 涨幅TOP{args.gainers}...",
+                file=sys.stderr,
+            )
+            rows, _ = enrich_boards(raw, "主题", args.leaders, args.gainers)
+        except RuntimeError as e:
+            print(e, file=sys.stderr)
+            return 1
+
+        tag = safe_filename_part(keyword)
+        out_txt = out_dir / f"theme_{tag}_{stamp}.txt"
+        title = (
+            f"主题「{keyword}」相关板块 | 成交额TOP{args.leaders} + "
+            f"涨幅TOP{args.gainers} | 北京时间 {time_label}"
+        )
+        write_aligned_txt(out_txt, title, rows, args.leaders, args.gainers)
+        written.append(str(out_txt))
+        if not args.no_print:
+            print(f"北京时间 {time_label} | 主题「{keyword}」共 {len(rows)} 个板块")
+            print_table(f"主题 {keyword}", rows, args.leaders, args.gainers)
+            print("\n已写出:")
+            for path in written:
+                print(f"  {path}")
+        else:
+            for path in written:
+                print(path)
+        return 0
+
+    do_in = args.side in ("inflow", "both")
+    do_out = args.side in ("outflow", "both")
+    in_top = args.in_top if args.in_top is not None else args.top
+    out_top = args.out_top if args.out_top is not None else args.top
+
+    if do_in and in_top <= 0:
+        print("--top/--in-top 必须 > 0", file=sys.stderr)
+        return 2
+    if do_out and out_top <= 0:
+        print("--top/--out-top 必须 > 0", file=sys.stderr)
+        return 2
+
+    inflow: list[dict] = []
+    outflow: list[dict] = []
+
+    try:
+        if do_in:
+            print(f"拉取净流入 TOP{in_top} ...", file=sys.stderr)
+            inflow_raw = fetch_board_flow(in_top, inflow=True)
+            print(
+                f"补充净流入行业成交额TOP{args.leaders} / 涨幅TOP{args.gainers}...",
+                file=sys.stderr,
+            )
+            inflow, _ = enrich_boards(
+                inflow_raw, "净流入", args.leaders, args.gainers
+            )
+        if do_out:
+            print(f"拉取净流出 TOP{out_top} ...", file=sys.stderr)
+            outflow_raw = fetch_board_flow(out_top, inflow=False)
+            print(
+                f"补充净流出行业成交额TOP{args.leaders} / 涨幅TOP{args.gainers}...",
+                file=sys.stderr,
+            )
+            outflow, _ = enrich_boards(
+                outflow_raw, "净流出", args.leaders, args.gainers
+            )
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        return 1
+
+    if do_in and inflow:
+        inflow_txt = out_dir / f"industry_inflow_top{in_top}_{stamp}.txt"
+        title_in = (
+            f"行业主力净流入 TOP{in_top} | 成交额TOP{args.leaders} + "
+            f"涨幅TOP{args.gainers} | 北京时间 {time_label}"
+        )
+        write_aligned_txt(inflow_txt, title_in, inflow, args.leaders, args.gainers)
+        written.append(str(inflow_txt))
+        if not args.no_print:
+            print(
+                f"北京时间 {time_label} | "
+                f"净流入 TOP{in_top} + 成交额TOP{args.leaders} + 涨幅TOP{args.gainers}"
+            )
+            print_table(f"净流入 TOP{in_top}", inflow, args.leaders, args.gainers)
+
+    if do_out and outflow:
+        outflow_txt = out_dir / f"industry_outflow_top{out_top}_{stamp}.txt"
+        title_out = (
+            f"行业主力净流出 TOP{out_top} | 成交额TOP{args.leaders} + "
+            f"涨幅TOP{args.gainers} | 北京时间 {time_label}"
+        )
+        write_aligned_txt(outflow_txt, title_out, outflow, args.leaders, args.gainers)
+        written.append(str(outflow_txt))
+        if not args.no_print:
+            print(
+                f"北京时间 {time_label} | "
+                f"净流出 TOP{out_top} + 成交额TOP{args.leaders} + 涨幅TOP{args.gainers}"
+            )
+            print_table(f"净流出 TOP{out_top}", outflow, args.leaders, args.gainers)
+
+    if not written:
+        print("无数据可写出", file=sys.stderr)
+        return 1
+
+    if not args.no_print:
+        print("\n已写出:")
+        for path in written:
+            print(f"  {path}")
+    else:
+        for path in written:
+            print(path)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
