@@ -32,8 +32,8 @@ from pathlib import Path
 BJ = timezone(timedelta(hours=8))
 
 HOSTS = (
-    "https://push2.eastmoney.com",
     "https://push2delay.eastmoney.com",
+    "https://push2.eastmoney.com",
 )
 
 INDUSTRY_FS = "m:90+t:2+f:!50"
@@ -93,7 +93,7 @@ def http_get_json(url: str, timeout: float = 15.0) -> dict:
     return json.loads(raw)
 
 
-def clist_get(params: dict, retries: int = 4) -> list[dict]:
+def clist_get(params: dict, retries: int = 2) -> list[dict]:
     query = urllib.parse.urlencode(params)
     last_err: Exception | None = None
     for host in HOSTS:
