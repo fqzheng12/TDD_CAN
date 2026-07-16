@@ -3,12 +3,16 @@
 
 用法:
   python3 scripts/export_sector_fundflow.py
-  python3 scripts/export_sector_fundflow.py --out data/fundflow
+  python3 scripts/export_sector_fundflow.py --side both --top 30
+  python3 scripts/export_sector_fundflow.py --side inflow --top 20
+  python3 scripts/export_sector_fundflow.py --side outflow --top 10
   python3 scripts/export_sector_fundflow.py --top 30 --leaders 3 --gainers 5
 
 说明:
   - f62 为主力净流入（元），属行情商估算，非交易所官方持仓。
-  - 默认优先 push2 实时接口，失败则回退 push2delay。
+  - 默认优先 push2delay，失败再试 push2。
+  - --side 可选 inflow / outflow / both，控制只拉流入、只拉流出或两边都拉。
+  - --top 控制所选方向的行业名次数量；也可用 --in-top / --out-top 分别指定。
   - 每个行业导出：成交额最大 N 只（默认 3）+ 涨幅榜 M 只（默认 5）。
   - 涨幅榜优先选约 10% 涨停股，不以涨跌幅数值大小为主排序。
   - 终端/TXT 使用中文显示宽度对齐；CSV 供 Excel。
@@ -420,7 +424,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="导出行业主力资金净流入/流出 TOP N，并附成交额/涨幅股票"
     )
-    parser.add_argument("--top", type=int, default=30, help="各榜行业条数，默认 30")
+    parser.add_argument(
+        "--side",
+        choices=("inflow", "outflow", "both"),
+        default="both",
+        help="只拉流入 / 只拉流出 / 两边都拉，默认 both",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=30,
+        help="所选方向的行业名次数，默认 30；可被 --in-top/--out-top 覆盖",
+    )
+    parser.add_argument(
+        "--in-top",
+        type=int,
+        default=None,
+        help="净流入行业名次数（仅 side=inflow/both 时生效）",
+    )
+    parser.add_argument(
+        "--out-top",
+        type=int,
+        default=None,
+        help="净流出行业名次数（仅 side=outflow/both 时生效）",
+    )
     parser.add_argument(
         "--leaders",
         type=int,
@@ -442,106 +469,154 @@ def main() -> int:
     parser.add_argument("--no-print", action="store_true", help="不打印表格，只写文件")
     args = parser.parse_args()
 
-    if args.top <= 0 or args.leaders < 0 or args.gainers < 0:
-        print("--top 必须 > 0，--leaders/--gainers 必须 >= 0", file=sys.stderr)
+    do_in = args.side in ("inflow", "both")
+    do_out = args.side in ("outflow", "both")
+    in_top = args.in_top if args.in_top is not None else args.top
+    out_top = args.out_top if args.out_top is not None else args.top
+
+    if args.leaders < 0 or args.gainers < 0:
+        print("--leaders/--gainers 必须 >= 0", file=sys.stderr)
+        return 2
+    if do_in and in_top <= 0:
+        print("--top/--in-top 必须 > 0", file=sys.stderr)
+        return 2
+    if do_out and out_top <= 0:
+        print("--top/--out-top 必须 > 0", file=sys.stderr)
         return 2
 
     now = bj_now()
     stamp = now.strftime("%Y%m%d_%H%M%S")
     day = now.strftime("%Y-%m-%d")
+    out_dir = args.out
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    inflow: list[dict] = []
+    outflow: list[dict] = []
+    inflow_stocks: list[dict] = []
+    outflow_stocks: list[dict] = []
+    files_meta: dict[str, str] = {}
 
     try:
-        inflow_raw = fetch_board_flow(args.top, inflow=True)
-        outflow_raw = fetch_board_flow(args.top, inflow=False)
+        if do_in:
+            print(f"拉取净流入 TOP{in_top} ...", file=sys.stderr)
+            inflow_raw = fetch_board_flow(in_top, inflow=True)
+            print(
+                f"补充净流入行业成交额TOP{args.leaders} / 涨幅TOP{args.gainers}...",
+                file=sys.stderr,
+            )
+            inflow, inflow_stocks = enrich_boards(
+                inflow_raw, "净流入", args.leaders, args.gainers
+            )
+        if do_out:
+            print(f"拉取净流出 TOP{out_top} ...", file=sys.stderr)
+            outflow_raw = fetch_board_flow(out_top, inflow=False)
+            print(
+                f"补充净流出行业成交额TOP{args.leaders} / 涨幅TOP{args.gainers}...",
+                file=sys.stderr,
+            )
+            outflow, outflow_stocks = enrich_boards(
+                outflow_raw, "净流出", args.leaders, args.gainers
+            )
     except RuntimeError as e:
         print(e, file=sys.stderr)
         return 1
 
-    print(
-        f"正在补充各行业成交额TOP{args.leaders} / 涨幅TOP{args.gainers}股票...",
-        file=sys.stderr,
-    )
-    inflow, inflow_stocks = enrich_boards(
-        inflow_raw, "净流入", args.leaders, args.gainers
-    )
-    outflow, outflow_stocks = enrich_boards(
-        outflow_raw, "净流出", args.leaders, args.gainers
-    )
-
-    out_dir = args.out
-    inflow_path = out_dir / f"industry_inflow_top{args.top}_{stamp}.csv"
-    outflow_path = out_dir / f"industry_outflow_top{args.top}_{stamp}.csv"
+    stocks_all = inflow_stocks + outflow_stocks
     stocks_path = out_dir / f"industry_top_stocks_{stamp}.csv"
-    inflow_txt = out_dir / f"industry_inflow_top{args.top}_{stamp}.txt"
-    outflow_txt = out_dir / f"industry_outflow_top{args.top}_{stamp}.txt"
-    latest_in = out_dir / f"industry_inflow_top{args.top}_latest.csv"
-    latest_out = out_dir / f"industry_outflow_top{args.top}_latest.csv"
     latest_stocks = out_dir / "industry_top_stocks_latest.csv"
-    latest_in_txt = out_dir / f"industry_inflow_top{args.top}_latest.txt"
-    latest_out_txt = out_dir / f"industry_outflow_top{args.top}_latest.txt"
+    if stocks_all:
+        write_csv(stocks_path, stocks_all)
+        write_csv(latest_stocks, stocks_all)
+        written.extend([str(stocks_path), str(latest_stocks)])
+        files_meta["top_stocks"] = str(stocks_path)
+        files_meta["top_stocks_latest"] = str(latest_stocks)
+
+    if do_in and inflow:
+        inflow_path = out_dir / f"industry_inflow_top{in_top}_{stamp}.csv"
+        inflow_txt = out_dir / f"industry_inflow_top{in_top}_{stamp}.txt"
+        latest_in = out_dir / f"industry_inflow_top{in_top}_latest.csv"
+        latest_in_txt = out_dir / f"industry_inflow_top{in_top}_latest.txt"
+        title_in = (
+            f"行业主力净流入 TOP{in_top} | 成交额TOP{args.leaders} + "
+            f"涨幅TOP{args.gainers} | {stamp}"
+        )
+        write_csv(inflow_path, inflow)
+        write_csv(latest_in, inflow)
+        write_aligned_txt(inflow_txt, title_in, inflow, args.leaders, args.gainers)
+        write_aligned_txt(latest_in_txt, title_in, inflow, args.leaders, args.gainers)
+        written.extend(
+            [str(inflow_path), str(inflow_txt), str(latest_in), str(latest_in_txt)]
+        )
+        files_meta.update(
+            {
+                "inflow": str(inflow_path),
+                "inflow_txt": str(inflow_txt),
+                "inflow_latest": str(latest_in),
+                "inflow_latest_txt": str(latest_in_txt),
+            }
+        )
+        if not args.no_print:
+            print(
+                f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"净流入 TOP{in_top} + 成交额TOP{args.leaders} + 涨幅TOP{args.gainers}"
+            )
+            print_table(f"净流入 TOP{in_top}", inflow, args.leaders, args.gainers)
+
+    if do_out and outflow:
+        outflow_path = out_dir / f"industry_outflow_top{out_top}_{stamp}.csv"
+        outflow_txt = out_dir / f"industry_outflow_top{out_top}_{stamp}.txt"
+        latest_out = out_dir / f"industry_outflow_top{out_top}_latest.csv"
+        latest_out_txt = out_dir / f"industry_outflow_top{out_top}_latest.txt"
+        title_out = (
+            f"行业主力净流出 TOP{out_top} | 成交额TOP{args.leaders} + "
+            f"涨幅TOP{args.gainers} | {stamp}"
+        )
+        write_csv(outflow_path, outflow)
+        write_csv(latest_out, outflow)
+        write_aligned_txt(outflow_txt, title_out, outflow, args.leaders, args.gainers)
+        write_aligned_txt(latest_out_txt, title_out, outflow, args.leaders, args.gainers)
+        written.extend(
+            [str(outflow_path), str(outflow_txt), str(latest_out), str(latest_out_txt)]
+        )
+        files_meta.update(
+            {
+                "outflow": str(outflow_path),
+                "outflow_txt": str(outflow_txt),
+                "outflow_latest": str(latest_out),
+                "outflow_latest_txt": str(latest_out_txt),
+            }
+        )
+        if not args.no_print:
+            print(
+                f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"净流出 TOP{out_top} + 成交额TOP{args.leaders} + 涨幅TOP{args.gainers}"
+            )
+            print_table(f"净流出 TOP{out_top}", outflow, args.leaders, args.gainers)
+
     meta_path = out_dir / f"industry_fundflow_meta_{stamp}.json"
-
-    write_csv(inflow_path, inflow)
-    write_csv(outflow_path, outflow)
-    write_csv(stocks_path, inflow_stocks + outflow_stocks)
-    write_csv(latest_in, inflow)
-    write_csv(latest_out, outflow)
-    write_csv(latest_stocks, inflow_stocks + outflow_stocks)
-
-    title_in = (
-        f"行业主力净流入 TOP{args.top} | 成交额TOP{args.leaders} + 涨幅TOP{args.gainers} | {stamp}"
-    )
-    title_out = (
-        f"行业主力净流出 TOP{args.top} | 成交额TOP{args.leaders} + 涨幅TOP{args.gainers} | {stamp}"
-    )
-    write_aligned_txt(inflow_txt, title_in, inflow, args.leaders, args.gainers)
-    write_aligned_txt(outflow_txt, title_out, outflow, args.leaders, args.gainers)
-    write_aligned_txt(latest_in_txt, title_in, inflow, args.leaders, args.gainers)
-    write_aligned_txt(latest_out_txt, title_out, outflow, args.leaders, args.gainers)
-
     meta = {
         "as_of": now.isoformat(),
         "trade_date_guess": day,
         "source": "eastmoney clist f62 + board constituents by f6/f3",
-        "note": "主力净流入为估算字段；成交额按 f6；涨幅榜优先 10%涨停，不以涨跌幅数值为主；TXT 为中文对齐文本",
-        "top": args.top,
+        "note": "主力净流入为估算字段；成交额按 f6；涨幅榜优先 10%涨停；可用 --side/--top 选择方向与名次",
+        "side": args.side,
+        "in_top": in_top if do_in else None,
+        "out_top": out_top if do_out else None,
         "leaders": args.leaders,
         "gainers": args.gainers,
-        "files": {
-            "inflow": str(inflow_path),
-            "outflow": str(outflow_path),
-            "top_stocks": str(stocks_path),
-            "inflow_txt": str(inflow_txt),
-            "outflow_txt": str(outflow_txt),
-            "inflow_latest": str(latest_in),
-            "outflow_latest": str(latest_out),
-            "top_stocks_latest": str(latest_stocks),
-            "inflow_latest_txt": str(latest_in_txt),
-            "outflow_latest_txt": str(latest_out_txt),
-        },
+        "files": files_meta,
     }
-    out_dir.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    written.append(str(meta_path))
 
     if not args.no_print:
-        print(
-            f"北京时间 {now.strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"行业资金流 TOP{args.top} + 成交额TOP{args.leaders} + 涨幅TOP{args.gainers}"
-        )
-        print_table(f"净流入 TOP{args.top}", inflow, args.leaders, args.gainers)
-        print_table(f"净流出 TOP{args.top}", outflow, args.leaders, args.gainers)
         print("\n已写出:")
-        print(f"  {inflow_path}")
-        print(f"  {outflow_path}")
-        print(f"  {stocks_path}")
-        print(f"  {inflow_txt}")
-        print(f"  {outflow_txt}")
-        print(f"  {latest_in}")
-        print(f"  {latest_out}")
-        print(f"  {latest_stocks}")
-        print(f"  {latest_in_txt}")
-        print(f"  {latest_out_txt}")
-        print(f"  {meta_path}")
+        for path in written:
+            print(f"  {path}")
+    else:
+        for path in written:
+            print(path)
 
     return 0
 
